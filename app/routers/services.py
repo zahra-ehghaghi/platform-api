@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from app.models.service import ServiceCreateRequest, ServiceCreateResponse
 from app.clients.github_client import github_client
 from app.clients.argocd_client import argocd_client
+from app.clients.k8s_client import k8s_client
 from app.core.config import settings
 
 router = APIRouter()
@@ -26,6 +27,20 @@ def create_service(request: ServiceCreateRequest):
         }
     )
 
+    k8s_client.create_namespace(
+        namespace=request.environment.value,
+        labels={
+            "managed-by": "platform-api",
+            "environment": request.environment.value,
+        },
+    )
+    k8s_client.ensure_resource_quota(namespace=request.environment.value)
+    k8s_client.ensure_limit_range(namespace=request.environment.value)
+    k8s_client.ensure_network_policy(namespace=request.environment.value)
+    k8s_client.ensure_service_account(namespace=request.environment.value)
+    k8s_client.ensure_role(namespace=request.environment.value)
+    k8s_client.ensure_role_binding(namespace=request.environment.value)    
+
     repo_https_url = f"https://github.com/{settings.github_org}/{request.name}.git"
 
     argocd_client.ensure_repo(repo_https_url)
@@ -36,7 +51,6 @@ def create_service(request: ServiceCreateRequest):
         namespace=request.environment.value,
         values_file=f"values-{request.environment.value}.yaml",
     )
-    #argocd_client.sync_app(request.name)
 
     return ServiceCreateResponse(
         name=request.name,

@@ -1,8 +1,9 @@
 # Platform API
 
 A self-service Internal Developer Platform (IDP) backend that provisions
-services end-to-end: GitHub repository, CI/CD pipeline, and a GitOps-managed
-Kubernetes deployment via ArgoCD — triggered by a single API call.
+services end-to-end: GitHub repository, CI/CD pipeline, a multi-tenant
+Kubernetes namespace, and a GitOps-managed deployment via ArgoCD — triggered
+by a single API call.
 
 Built as the next evolution of a Backstage-based developer portal, this
 project moves provisioning logic **out of** Backstage templates and CI/CD
@@ -30,9 +31,9 @@ POST /services
 }
 ```
 
-Everything downstream — repo creation, template files, ArgoCD registration —
-is handled by the API itself, callable from Backstage, a CLI, or any other
-CI/CD system.
+Everything downstream — repo creation, template files, namespace
+provisioning, tenant isolation, ArgoCD registration — is handled by the API
+itself, callable from Backstage, a CLI, or any other CI/CD system.
 
 ## Architecture
 
@@ -45,12 +46,15 @@ Backstage  ──or──  curl / any client
    ▼
 Platform API (FastAPI)
    │
-   ├──▶ GitHub API ──▶ new repository + templated source (single atomic commit)
+   ├──▶ GitHub API ────▶ new repository + templated source (single atomic commit)
    │
-   └──▶ ArgoCD API ──▶ Application (automated sync + selfHeal)
+   ├──▶ Kubernetes API ▶ Namespace + ResourceQuota + LimitRange
+   │                     + NetworkPolicy + ServiceAccount + Role + RoleBinding
+   │
+   └──▶ ArgoCD API ────▶ Application (automated sync + selfHeal)
                               │
                               ▼
-                         Kubernetes (GitOps)
+                         Kubernetes (GitOps, tenant-isolated)
 ```
 
 Once the repository exists, a GitHub Actions workflow in the generated repo
@@ -108,21 +112,55 @@ reintroduces the coupling this project removes), the platform accepts a
 transient `ImagePullBackOff` immediately after provisioning and relies on
 `selfHeal` to converge automatically once the first CI/CD run completes.
 
+**Namespace isolation is provisioned by the platform, not by ArgoCD's `CreateNamespace` flag.**
+Earlier, namespaces were created implicitly by ArgoCD's `CreateNamespace=true`
+sync option — which produces a bare namespace with no quota, no limits, no
+network policy, and no scoped identity. The platform now creates the
+namespace itself, before the Application is registered, and immediately
+attaches the tenant-isolation primitives below. ArgoCD's `CreateNamespace`
+option is kept only as a harmless no-op fallback.
+
+**Least-privilege RBAC per namespace, not a shared default ServiceAccount.**
+Each namespace gets its own `ServiceAccount` bound to a `Role` (not a
+`ClusterRole`) that only grants `get/list/watch` on `pods`, `services`, and
+`configmaps` — deliberately excluding `secrets` and any write verb. Scoping
+to `Role`/`RoleBinding` instead of cluster-wide equivalents means a
+credential obtained in `dev` has no authority in `prod`, verified directly
+with `kubectl auth can-i --as=system:serviceaccount:...`.
+
+**All provisioning steps are idempotent.**
+Every Kubernetes/GitHub/ArgoCD client method checks for existence before
+creating, so re-registering an existing repo, namespace, quota, policy, or
+Application is a no-op rather than an error. This matters because multiple
+services share the same `dev`/`prod` namespace — the tenant-isolation
+resources are only created once, on the first service in that environment.
+
 ## What it does today
 
 - `POST /services` — creates a GitHub repository from a language-specific
   template (currently Python/Flask), pushes Helm chart + Dockerfile +
-  starter app + CI/CD workflow in a single commit, registers the repo with
-  ArgoCD, and creates an auto-syncing Application scoped to the requested
-  namespace.
-- Idempotent by design: re-registering an existing repo or Application is a
-  no-op rather than an error.
+  starter app + CI/CD workflow in a single commit, provisions a tenant-isolated
+  namespace, registers the repo with ArgoCD, and creates an auto-syncing
+  Application scoped to that namespace.
+- **Tenant isolation per namespace**, applied automatically and idempotently:
+  - `ResourceQuota` — caps aggregate CPU/memory requests & limits and pod
+    count for the whole namespace
+  - `LimitRange` — default/min/max CPU & memory per container, so workloads
+    that omit `resources:` don't go unbounded
+  - `NetworkPolicy` — denies ingress by default; allows traffic only from
+    pods in the same namespace and from `ingress-nginx`
+  - `ServiceAccount` + `Role` + `RoleBinding` — least-privilege, namespace-scoped
+    identity (read-only on pods/services/configmaps, no secrets access)
+- Idempotent by design: re-registering an existing repo, namespace, or
+  Application is a no-op rather than an error.
 
 ## Tech stack
 
 - **FastAPI** — API framework, request validation via Pydantic models/enums
 - **PyGithub** — repository and Git Tree API operations
 - **httpx** — ArgoCD REST API client (session auth, repository/application management)
+- **kubernetes** (official Python client) — namespace, quota, limit range,
+  network policy, and RBAC provisioning
 - **ArgoCD** — GitOps continuous delivery
 - **GitHub Actions** — per-service CI/CD (build/push image, bump Helm values)
 - **Kubernetes (kind)** — target runtime
@@ -139,7 +177,9 @@ platform-api/
 │   │   └── service.py          # Request/response schemas, Language & Environment enums
 │   ├── clients/
 │   │   ├── github_client.py    # Repo creation, atomic template push (Git Tree API)
-│   │   └── argocd_client.py    # Session auth, repo registration, Application lifecycle
+│   │   ├── argocd_client.py    # Session auth, repo registration, Application lifecycle
+│   │   └── k8s_client.py       # Namespace, ResourceQuota, LimitRange,
+│   │                           # NetworkPolicy, ServiceAccount, Role, RoleBinding
 │   ├── routers/
 │   │   └── services.py         # POST /services orchestration
 │   └── templates/
@@ -169,6 +209,11 @@ DOCKERHUB_USERNAME=your-dockerhub-username
 ARGOCD_VERIFY_SSL=false
 ```
 
+Kubernetes access is picked up automatically: the client tries
+`load_incluster_config()` first (for when the API runs inside the cluster)
+and falls back to `~/.kube/config` for local development — no extra
+configuration needed either way.
+
 Run:
 
 ```bash
@@ -185,13 +230,35 @@ curl -X POST http://localhost:8000/services \
   -d '{"name": "demo-service", "language": "python", "environment": "dev"}'
 ```
 
+Verify tenant isolation for a namespace:
+
+```bash
+kubectl get resourcequota,limitrange,networkpolicy,serviceaccount,role,rolebinding -n dev
+
+# Confirm least-privilege RBAC:
+kubectl auth can-i list pods -n dev --as=system:serviceaccount:dev:platform-app      # yes
+kubectl auth can-i list secrets -n dev --as=system:serviceaccount:dev:platform-app   # no
+kubectl auth can-i delete pods -n dev --as=system:serviceaccount:dev:platform-app    # no
+kubectl auth can-i list pods -n prod --as=system:serviceaccount:dev:platform-app     # no
+```
+
 ## Known limitations / next steps
 
 This is an active work-in-progress platform, not a finished product. Current
 gaps, tracked as the next iteration of this project:
 
-- **Multi-tenancy** — namespaces are created via ArgoCD's `CreateNamespace`
-  option with no `ResourceQuota`, `LimitRange`, or `NetworkPolicy` applied yet.
+- **NetworkPolicy enforcement depends on the CNI.** Policies are created via
+  the Kubernetes API regardless of cluster, but enforcement requires a
+  policy-aware CNI (e.g. Calico, Cilium). The default `kind` cluster used for
+  local development runs `kindnet`, which does not enforce `NetworkPolicy` —
+  the policies are correctly defined but not actively enforced in this
+  environment. Egress is intentionally left unrestricted for now; only
+  ingress is controlled.
+- **Namespaces are shared per environment**, not per service (`dev` and
+  `prod`, not `payment-service-dev`). Tenant-isolation resources are created
+  once per namespace and shared by every service in that environment — a
+  design trade-off, not an oversight, worth revisiting if per-service
+  isolation becomes a requirement.
 - **Secrets management** — GitHub/ArgoCD/DockerHub credentials are still
   environment-variable based; no Vault integration yet.
 - **Observability** — no automatic `ServiceMonitor` or dashboard provisioning
@@ -199,8 +266,8 @@ gaps, tracked as the next iteration of this project:
 - **Single language template** — only Python/Flask exists; Node/Go templates
   are planned.
 - **No background task / async status** — `POST /services` runs the full
-  provisioning flow synchronously; a long-running GitHub/ArgoCD API delay
-  blocks the response.
+  provisioning flow synchronously; a long-running GitHub/ArgoCD/Kubernetes
+  API delay blocks the response.
 
 ## Background
 
