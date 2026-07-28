@@ -1,0 +1,7 @@
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: platform-services
+  description: Services provisioned via the self-service Platform API
+spec:
+  owner: development

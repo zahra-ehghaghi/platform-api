@@ -2,12 +2,26 @@ apiVersion: backstage.io/v1alpha1
 kind: Component
 metadata:
   name: ${{values.app_name}}
-  description: Python app that displays the time. Name ${{values.app_name}}
-  # Example for optional annotations
+  description: A self-service provisioned Python/Flask service (${{values.app_env}})
   annotations:
     github.com/project-slug: zahra-ehghaghi-org/${{values.app_name}}
     backstage.io/techdocs-ref: dir:.
+  tags:
+    - python
+    - flask
+    - ${{values.app_env}}
+  links:
+    - url: https://github.com/zahra-ehghaghi-org/${{values.app_name}}
+      title: Source Repository
+      icon: github
+    - url: https://argocd.test.com/applications/${{values.app_name}}
+      title: ArgoCD Application
+      icon: dashboard
+    - url: http://grafana.test.com/d/platform-services-overview
+      title: Grafana Dashboard
+      icon: dashboard
 spec:
   type: service
   owner: development
-  lifecycle: experimental
+  lifecycle: ${{values.app_env}}
+  system: platform-services
