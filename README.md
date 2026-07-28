@@ -2,8 +2,8 @@
 
 A self-service Internal Developer Platform (IDP) backend that provisions
 services end-to-end: GitHub repository, CI/CD pipeline, a multi-tenant
-Kubernetes namespace, and a GitOps-managed deployment via ArgoCD — triggered
-by a single API call.
+Kubernetes namespace, a GitOps-managed deployment via ArgoCD, and observability
+(metrics, dashboard, alerting) — triggered by a single API call.
 
 Built as the next evolution of a Backstage-based developer portal, this
 project moves provisioning logic **out of** Backstage templates and CI/CD
@@ -32,8 +32,9 @@ POST /services
 ```
 
 Everything downstream — repo creation, template files, namespace
-provisioning, tenant isolation, ArgoCD registration — is handled by the API
-itself, callable from Backstage, a CLI, or any other CI/CD system.
+provisioning, tenant isolation, ArgoCD registration, and observability
+wiring — is handled by the API itself or by the generated service's own Helm
+chart, callable from Backstage, a CLI, or any other CI/CD system.
 
 ## Architecture
 
@@ -47,6 +48,8 @@ Backstage  ──or──  curl / any client
 Platform API (FastAPI)
    │
    ├──▶ GitHub API ────▶ new repository + templated source (single atomic commit)
+   │                     (includes Helm chart, Dockerfile, CI/CD workflow,
+   │                      ServiceMonitor, and PrometheusRule)
    │
    ├──▶ Kubernetes API ▶ Namespace + ResourceQuota + LimitRange
    │                     + NetworkPolicy + ServiceAccount + Role + RoleBinding
@@ -55,6 +58,12 @@ Platform API (FastAPI)
                               │
                               ▼
                          Kubernetes (GitOps, tenant-isolated)
+                              │
+                              ▼
+                    Prometheus scrapes /metrics via ServiceMonitor
+                              │
+                              ▼
+                Grafana (dashboard-as-code) + PrometheusRule alerting
 ```
 
 Once the repository exists, a GitHub Actions workflow in the generated repo
@@ -135,6 +144,40 @@ Application is a no-op rather than an error. This matters because multiple
 services share the same `dev`/`prod` namespace — the tenant-isolation
 resources are only created once, on the first service in that environment.
 
+**Observability is defined per-service in the Helm chart, not orchestrated by the Platform API.**
+`ResourceQuota`, `LimitRange`, `NetworkPolicy`, and RBAC are namespace/tenant
+level concerns, so the Platform API provisions them directly via the
+Kubernetes client. `ServiceMonitor` and `PrometheusRule`, by contrast, are
+workload-level resources scoped to one specific service — so they live in the
+Helm chart template next to the `Deployment` and `Service` they describe, and
+are deployed by ArgoCD along with everything else. This keeps
+service-specific concerns in the service's own Git history rather than
+centralizing them in platform code.
+
+**Metric labels come from Kubernetes service discovery, not from application code.**
+The first version of the alerting/dashboard queries assumed a custom
+`app_name` label (set explicitly via `metrics.info(...)` in the Flask app)
+would appear on every metric, including the auto-generated
+`flask_http_request_total` and `flask_http_request_duration_seconds_bucket`
+series. It doesn't — `metrics.info(...)` only labels the standalone
+`app_info` gauge it creates, while the request/duration metrics are labeled
+by the exporter middleware itself (`method`, `path`, `status`, etc.).
+Prometheus Operator's own service discovery adds the `service` label from the
+matched `Service` object, which is always accurate and consistent regardless
+of what the application code does — dashboards and alert rules were switched
+to group by `service` instead. Lesson: metric label assumptions should be
+verified with a live query against Prometheus, not inferred from what the
+application code appears to set.
+
+**Dashboards and alerts are provisioned as code, not created manually in the UI.**
+The Grafana dashboard is a JSON file wrapped in a `ConfigMap` labeled
+`grafana_dashboard: "1"`, picked up automatically by the `kube-prometheus-stack`
+sidecar. A dashboard created directly in the Grafana UI only exists in
+Grafana's internal database and disappears if the pod/release is recreated;
+the ConfigMap-provisioned version is reproducible from Git alone. The same
+principle applies to alerting — `PrometheusRule` is a per-service Helm
+template, not a rule typed into the Prometheus/Alertmanager UI.
+
 ## What it does today
 
 - `POST /services` — creates a GitHub repository from a language-specific
@@ -151,6 +194,16 @@ resources are only created once, on the first service in that environment.
     pods in the same namespace and from `ingress-nginx`
   - `ServiceAccount` + `Role` + `RoleBinding` — least-privilege, namespace-scoped
     identity (read-only on pods/services/configmaps, no secrets access)
+- **Observability per service**, shipped as part of the generated Helm chart:
+  - Flask app exposes Prometheus metrics at `/metrics` via
+    `prometheus-flask-exporter` (request count, request duration histogram)
+  - `ServiceMonitor` registers the service with Prometheus automatically —
+    no manual target configuration
+  - `PrometheusRule` defines a `HighErrorRate` alert (>5% 5xx rate sustained
+    for 2 minutes), scoped to that service via the `service` label
+  - A platform-wide Grafana dashboard (`Platform Services Overview`) shows
+    request rate, error rate, and p95 latency across all services,
+    provisioned via a labeled `ConfigMap` rather than created manually
 - Idempotent by design: re-registering an existing repo, namespace, or
   Application is a no-op rather than an error.
 
@@ -163,6 +216,10 @@ resources are only created once, on the first service in that environment.
   network policy, and RBAC provisioning
 - **ArgoCD** — GitOps continuous delivery
 - **GitHub Actions** — per-service CI/CD (build/push image, bump Helm values)
+- **kube-prometheus-stack** (Prometheus Operator, Prometheus, Grafana) — metrics,
+  dashboards, alerting
+- **prometheus-flask-exporter** — metrics instrumentation for the generated
+  Flask service template
 - **Kubernetes (kind)** — target runtime
 
 ## Project structure
@@ -184,7 +241,13 @@ platform-api/
 │   │   └── services.py         # POST /services orchestration
 │   └── templates/
 │       └── python/             # Flask service template: Helm chart, Dockerfile,
-│                                # starter app, GitHub Actions workflow
+│                                # starter app (instrumented with /metrics),
+│                                # GitHub Actions workflow, ServiceMonitor,
+│                                # PrometheusRule
+├── infra/
+│   └── grafana/
+│       ├── dashboard.json                          # Dashboard-as-code (JSON model)
+│       └── platform-services-overview-configmap.yaml
 ├── requirements.txt
 └── Dockerfile
 ```
@@ -242,6 +305,20 @@ kubectl auth can-i delete pods -n dev --as=system:serviceaccount:dev:platform-ap
 kubectl auth can-i list pods -n prod --as=system:serviceaccount:dev:platform-app     # no
 ```
 
+Verify observability for a service (after its first CI/CD run has completed):
+
+```bash
+kubectl get servicemonitor,prometheusrule -n dev
+
+# Port-forward Prometheus and check the target is UP:
+kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090
+# open http://localhost:9090/targets and http://localhost:9090/alerts
+
+# Port-forward Grafana and check the platform-wide dashboard:
+kubectl port-forward -n monitoring svc/kube-prometheus-stack-grafana 3000:80
+# open http://localhost:3000/dashboards → "Platform Services Overview"
+```
+
 ## Known limitations / next steps
 
 This is an active work-in-progress platform, not a finished product. Current
@@ -259,10 +336,12 @@ gaps, tracked as the next iteration of this project:
   once per namespace and shared by every service in that environment — a
   design trade-off, not an oversight, worth revisiting if per-service
   isolation becomes a requirement.
+- **Alerting has no notification channel configured yet.** `PrometheusRule`
+  fires and is visible in the Prometheus/Alertmanager UI, but Alertmanager
+  is not yet wired to Slack/email/PagerDuty — routing and receivers are a
+  next step.
 - **Secrets management** — GitHub/ArgoCD/DockerHub credentials are still
   environment-variable based; no Vault integration yet.
-- **Observability** — no automatic `ServiceMonitor` or dashboard provisioning
-  per service yet.
 - **Single language template** — only Python/Flask exists; Node/Go templates
   are planned.
 - **No background task / async status** — `POST /services` runs the full

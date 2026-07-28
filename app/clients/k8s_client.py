@@ -105,6 +105,11 @@ class K8sClient:
                                     match_labels={"kubernetes.io/metadata.name": "ingress-nginx"}
                                 )
                             ),
+                            client.V1NetworkPolicyPeer(
+                                namespace_selector=client.V1LabelSelector(
+                                    match_labels={"kubernetes.io/metadata.name": "monitoring"}
+                                )
+                            ),                            
                         ]
                     )
                 ],
