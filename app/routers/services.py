@@ -39,7 +39,7 @@ def create_service(request: ServiceCreateRequest):
     k8s_client.ensure_network_policy(namespace=request.environment.value)
     k8s_client.ensure_service_account(namespace=request.environment.value)
     k8s_client.ensure_role(namespace=request.environment.value)
-    k8s_client.ensure_role_binding(namespace=request.environment.value)    
+    k8s_client.ensure_role_binding(namespace=request.environment.value)
 
     repo_https_url = f"https://github.com/{settings.github_org}/{request.name}.git"
 
