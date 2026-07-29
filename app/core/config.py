@@ -1,4 +1,5 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
     github_token: str
@@ -8,8 +9,8 @@ class Settings(BaseSettings):
     argocd_password: str
     dockerhub_username: str
     argocd_verify_ssl: bool = False
-    
-    class Config:
-        env_file = ".env"
+
+    model_config = SettingsConfigDict(env_file=".env")
+
 
 settings = Settings()
