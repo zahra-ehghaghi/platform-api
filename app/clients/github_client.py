@@ -1,12 +1,25 @@
 import os
-from github import Github, GithubException, InputGitTreeElement
+from github import Auth, Github, GithubException, InputGitTreeElement
 from app.core.config import settings
 
 
 class GithubClient:
     def __init__(self):
-        self._client = Github(settings.github_token)
-        self._org = self._client.get_organization(settings.github_org)
+        self._client = Github(auth=Auth.Token(settings.github_token))
+        self._org_cache = None
+
+    @property
+    def _org(self):
+        # Lazy: the real network call (get_organization) only happens the
+        # first time this is actually needed, not when GithubClient() is
+        # constructed. This matters because a module-level singleton
+        # (github_client = GithubClient(), at the bottom of this file) is
+        # created as soon as this module is imported - if __init__ did the
+        # network call directly, simply importing this file (e.g. from a
+        # test) would require live network access and valid credentials.
+        if self._org_cache is None:
+            self._org_cache = self._client.get_organization(settings.github_org)
+        return self._org_cache
 
     def create_repository(self, name: str, description: str) -> str:
         try:

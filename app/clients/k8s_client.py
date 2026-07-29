@@ -3,14 +3,48 @@ from kubernetes import client, config
 
 class K8sClient:
     def __init__(self):
+        self._configured = False
+        self._core_v1_cache = None
+        self._networking_v1_cache = None
+        self._rbac_v1_cache = None
+
+    def _ensure_configured(self):
+        # Lazy: config loading (and the API client objects built on top of
+        # it) only happens on first real use, not when K8sClient() is
+        # constructed. This matters because a module-level singleton
+        # (k8s_client = K8sClient(), at the bottom of this file) is created
+        # as soon as this module is imported - if __init__ loaded config
+        # directly, simply importing this file (e.g. from a test, or from
+        # any code that imports app.routers.services) would require a
+        # reachable cluster or a valid ~/.kube/config to succeed.
+        if self._configured:
+            return
         try:
             config.load_incluster_config()
         except config.ConfigException:
             config.load_kube_config()
+        self._configured = True
 
-        self._core_v1 = client.CoreV1Api()
-        self._networking_v1 = client.NetworkingV1Api()
-        self._rbac_v1 = client.RbacAuthorizationV1Api()
+    @property
+    def _core_v1(self):
+        self._ensure_configured()
+        if self._core_v1_cache is None:
+            self._core_v1_cache = client.CoreV1Api()
+        return self._core_v1_cache
+
+    @property
+    def _networking_v1(self):
+        self._ensure_configured()
+        if self._networking_v1_cache is None:
+            self._networking_v1_cache = client.NetworkingV1Api()
+        return self._networking_v1_cache
+
+    @property
+    def _rbac_v1(self):
+        self._ensure_configured()
+        if self._rbac_v1_cache is None:
+            self._rbac_v1_cache = client.RbacAuthorizationV1Api()
+        return self._rbac_v1_cache
 
     def namespace_exists(self, namespace: str) -> bool:
         try:
@@ -80,6 +114,7 @@ class K8sClient:
             ),
         )
         self._core_v1.create_namespaced_limit_range(namespace=namespace, body=body)
+
     def ensure_network_policy(self, namespace: str):
         policy_name = "default-allow-same-namespace-and-ingress"
         try:
@@ -105,17 +140,13 @@ class K8sClient:
                                     match_labels={"kubernetes.io/metadata.name": "ingress-nginx"}
                                 )
                             ),
-                            client.V1NetworkPolicyPeer(
-                                namespace_selector=client.V1LabelSelector(
-                                    match_labels={"kubernetes.io/metadata.name": "monitoring"}
-                                )
-                            ),                            
                         ]
                     )
                 ],
             ),
         )
-        self._networking_v1.create_namespaced_network_policy(namespace=namespace, body=body)        
+        self._networking_v1.create_namespaced_network_policy(namespace=namespace, body=body)
+
     def ensure_service_account(self, namespace: str, name: str = "platform-app"):
         try:
             self._core_v1.read_namespaced_service_account(name=name, namespace=namespace)
@@ -173,5 +204,8 @@ class K8sClient:
                 name=role,
             ),
         )
-        self._rbac_v1.create_namespaced_role_binding(namespace=namespace, body=body)        
+        self._rbac_v1.create_namespaced_role_binding(namespace=namespace, body=body)
+
+
 k8s_client = K8sClient()
+
