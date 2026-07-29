@@ -1,0 +1,74 @@
+app:
+  baseUrl: http://192.168.116.138:7007
+  listen:
+    host: 0.0.0.0
+backend:
+  baseUrl: http://192.168.116.138:7007
+  listen:
+    port: 7007
+    host: 0.0.0.0
+  csp:
+    upgrade-insecure-requests: false
+    connect-src: ["'self'", 'http:', 'https:']
+  headers:
+    Strict-Transport-Security: false
+
+  # config options: https://node-postgres.com/apis/client
+  database:
+    client: pg
+    connection:
+      host: ${POSTGRES_HOST}
+      port: 5432
+      user: ${POSTGRES_USER}
+      password: ${POSTGRES_PASSWORD}
+
+auth:
+  environment: production
+  providers:
+    github:
+      production:
+        clientId: ${AUTH_GITHUB_CLIENT_ID}
+        clientSecret: ${AUTH_GITHUB_CLIENT_SECRET}
+        signIn:
+          resolvers:
+            - resolver: usernameMatchingUserEntityName
+
+catalog:
+  rules:
+    - allow: [Component, System, API, Resource, Location]
+  locations:
+    # Local example data, file locations are relative to the backend process,
+    # typically `packages/backend`
+    - type: file
+      target: /app/entities/users.yaml
+      rules:
+        - allow: [User]
+
+    - type: file
+      target: /app/entities/groups.yaml
+      rules:
+        - allow: [Group]
+
+    - type: url
+      target: https://github.com/zahra-ehghaghi/backstage-software-templates/blob/master/python-app/template.yaml
+      rules:
+        - allow: [Template]
+
+    - type: url
+      target: https://github.com/zahra-ehghaghi/platform-api/blob/main/catalog/system.yaml
+      rules:
+        - allow: [System]
+
+techdocs:
+  builder: 'local'
+  publisher:
+    type: 'local'
+  generator:
+    runIn: local
+
+integrations:
+  github:
+    - host: github.com
+      # Personal Access Token, injected via the backstage-secrets Secret at
+      # deploy time. See https://backstage.io/docs/integrations/github/locations#configuration
+      token: ${GITHUB_TOKEN}

@@ -1,0 +1,22 @@
+# PostgreSQL values for the Backstage database.
+#
+# NOTE: postgresPassword/username/password/database below are placeholders.
+# bootstrap.sh overrides them at install time with --set, sourced from
+# environment variables (BACKSTAGE_DB_PASSWORD), so this file never needs to
+# contain a real credential and is safe to commit.
+global:
+  postgresql:
+    auth:
+      postgresPassword: "CHANGEME"
+      username: "backstage"
+      password: "CHANGEME"
+      database: "backstage"
+primary:
+  name: primary
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+  persistence:
+    enabled: true
+    size: 8Gi

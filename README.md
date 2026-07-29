@@ -245,12 +245,53 @@ platform-api/
 │                                # GitHub Actions workflow, ServiceMonitor,
 │                                # PrometheusRule
 ├── infra/
+│   ├── bootstrap.sh                                 # Provisions kind + ingress-nginx + ArgoCD
+│   │                                                 # + PostgreSQL + Backstage + Prometheus stack
+│   ├── kind-config.yaml
+│   ├── app-config.production.yaml
+│   ├── .env.infra.example                           # Template for required secrets (gitignored when filled in)
+│   ├── values/                                      # Helm values (ArgoCD, PostgreSQL)
+│   ├── manifests/                                   # Backstage, CoreDNS, Prometheus/Grafana ingresses
 │   └── grafana/
 │       ├── dashboard.json                          # Dashboard-as-code (JSON model)
 │       └── platform-services-overview-configmap.yaml
 ├── requirements.txt
 └── Dockerfile
 ```
+
+## Prerequisites
+
+This project assumes the following already exist and are reachable. They
+are **not provisioned by Platform API itself** — but they can be
+provisioned in one step using the bootstrap script in [`infra/`](infra/),
+which captures the exact cluster, ArgoCD, and Prometheus Operator setup
+this project was built and tested against:
+
+```bash
+cp infra/.env.infra.example infra/.env.infra
+# fill in real values in infra/.env.infra (gitignored, never commit it)
+set -a; source infra/.env.infra; set +a
+./infra/bootstrap.sh
+```
+
+See [`infra/README.md`](infra/README.md) for what the script does step by
+step. If you already have your own cluster/ArgoCD/Prometheus setup, you can
+skip it entirely — Platform API only needs the following to be reachable:
+
+- A running Kubernetes cluster (developed and tested against a local `kind`
+  cluster) with the current user's `kubectl` context pointing at it
+- [ArgoCD](https://argo-cd.readthedocs.io/) installed in the cluster, with
+  API access reachable from wherever Platform API runs (locally, this is
+  usually an Ingress hostname or a `kubectl port-forward`)
+- [Prometheus Operator](https://github.com/prometheus-operator/kube-prometheus)
+  installed in the cluster (e.g. via the `kube-prometheus-stack` Helm chart),
+  so that the `ServiceMonitor` and `PrometheusRule` resources each generated
+  service ships with are actually picked up
+- A GitHub organization you have admin access to, and a
+  [Personal Access Token](https://github.com/settings/tokens) with repo
+  creation permissions
+- A Docker Hub account (or another registry) for the generated CI/CD
+  workflows to push images to
 
 ## Running locally
 
