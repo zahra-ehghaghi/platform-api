@@ -10,6 +10,20 @@ def client():
     return ArgocdClient()
 
 
+@pytest.fixture(autouse=True)
+def mock_vault_password():
+    """
+    _login() now reads the ArgoCD password from Vault before calling the
+    session endpoint. Applied automatically to every test in this file so
+    individual tests don't need to remember to patch it.
+    """
+    with patch(
+        "app.clients.argocd_client.vault_client.get_secret",
+        return_value="fake-password",
+    ):
+        yield
+
+
 def _mock_response(status_code=200, json_data=None):
     resp = MagicMock()
     resp.status_code = status_code
@@ -80,3 +94,4 @@ class TestEnsureRepo:
         client.ensure_repo("https://github.com/test-org/my-service.git")
 
         assert mock_post.call_count == 2
+

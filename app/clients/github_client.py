@@ -1,22 +1,30 @@
 import os
 from github import Auth, Github, GithubException, InputGitTreeElement
 from app.core.config import settings
+from app.clients.vault_client import vault_client
 
 
 class GithubClient:
     def __init__(self):
-        self._client = Github(auth=Auth.Token(settings.github_token))
+        self._client_cache = None
         self._org_cache = None
 
     @property
+    def _client(self):
+        # Lazy: fetching the token from Vault, and constructing the Github
+        # client with it, only happens on first real use - not when
+        # GithubClient() is constructed. Same reasoning as the _org lazy
+        # property below: a module-level singleton is created as soon as
+        # this module is imported, so doing I/O (a Vault call, in this
+        # case) directly in __init__ would make importing this file require
+        # a reachable Vault instance and a valid token.
+        if self._client_cache is None:
+            token = vault_client.get_secret("platform-api", "github_token")
+            self._client_cache = Github(auth=Auth.Token(token))
+        return self._client_cache
+
+    @property
     def _org(self):
-        # Lazy: the real network call (get_organization) only happens the
-        # first time this is actually needed, not when GithubClient() is
-        # constructed. This matters because a module-level singleton
-        # (github_client = GithubClient(), at the bottom of this file) is
-        # created as soon as this module is imported - if __init__ did the
-        # network call directly, simply importing this file (e.g. from a
-        # test) would require live network access and valid credentials.
         if self._org_cache is None:
             self._org_cache = self._client.get_organization(settings.github_org)
         return self._org_cache

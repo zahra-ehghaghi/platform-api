@@ -9,34 +9,39 @@ from app.clients.github_client import GithubClient
 @pytest.fixture
 def mock_github():
     """
-    Patches the `Github` class used inside github_client.py so that
-    instantiating GithubClient() never makes a real network call, and
-    returns the mock organization object for assertions.
+    Patches both the Vault read (so GithubClient's lazy _client property
+    doesn't try to make a real Vault call) and the `Github` class itself,
+    so instantiating GithubClient() and using it never makes a real network
+    call. Yields the mock organization object for assertions.
     """
-    with patch("app.clients.github_client.Github") as MockGithub:
+    with patch("app.clients.github_client.vault_client.get_secret", return_value="fake-token"), \
+         patch("app.clients.github_client.Github") as MockGithub:
         mock_org = MagicMock()
         MockGithub.return_value.get_organization.return_value = mock_org
         yield mock_org
 
 
-class TestLazyOrganizationLookup:
-    def test_constructing_client_does_not_call_get_organization(self):
-        with patch("app.clients.github_client.Github") as MockGithub:
+class TestLazyInitialization:
+    def test_constructing_client_does_not_call_vault_or_github(self):
+        with patch("app.clients.github_client.vault_client.get_secret") as mock_get_secret, \
+             patch("app.clients.github_client.Github") as MockGithub:
             GithubClient()
 
+            mock_get_secret.assert_not_called()
             MockGithub.return_value.get_organization.assert_not_called()
 
-    def test_org_lookup_happens_once_and_is_cached(self):
-        with patch("app.clients.github_client.Github") as MockGithub:
+    def test_vault_and_org_lookup_happen_once_and_are_cached(self):
+        with patch("app.clients.github_client.vault_client.get_secret", return_value="fake-token") as mock_get_secret, \
+             patch("app.clients.github_client.Github") as MockGithub:
             client = GithubClient()
 
-            # Trigger two operations that both need self._org
             client.get_repo("service-a")
             client.get_repo("service-b")
 
-            # get_organization should only have been called once, even
-            # though _org was accessed twice - the second access hits the
-            # cached value instead of calling the API again.
+            # Both the Vault read and the org lookup should only happen
+            # once, even though two operations needed them - the second
+            # access hits the cached values instead of repeating the calls.
+            mock_get_secret.assert_called_once_with("platform-api", "github_token")
             MockGithub.return_value.get_organization.assert_called_once()
 
 
@@ -74,3 +79,4 @@ class TestCreateRepository:
 
         with pytest.raises(GithubException):
             client.create_repository(name="my-service", description="test")
+

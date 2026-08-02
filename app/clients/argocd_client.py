@@ -1,5 +1,6 @@
 import httpx
 from app.core.config import settings
+from app.clients.vault_client import vault_client
 
 TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
@@ -14,11 +15,12 @@ class ArgocdClient:
         if self._token:
             return self._token
 
+        password = vault_client.get_secret("platform-api", "argocd_password")
         response = httpx.post(
             f"{self._base_url}/session",
             json={
                 "username": settings.argocd_username,
-                "password": settings.argocd_password,
+                "password": password,
             },
             verify=self._verify_ssl,
             timeout=TIMEOUT,

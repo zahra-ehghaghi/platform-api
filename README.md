@@ -178,6 +178,30 @@ the ConfigMap-provisioned version is reproducible from Git alone. The same
 principle applies to alerting — `PrometheusRule` is a per-service Helm
 template, not a rule typed into the Prometheus/Alertmanager UI.
 
+**Secrets are read from Vault at first use, not stored in `.env`.**
+`GITHUB_TOKEN` and `ARGOCD_PASSWORD` used to live directly in `.env` — every
+credential Platform API needed was one file away from being copied,
+committed, or leaked. They're now stored in Vault (KV v2, path
+`secret/platform-api`) and fetched by `VaultClient.get_secret()`, with only
+`VAULT_ADDR` and `VAULT_TOKEN` remaining in `.env`. `GithubClient` and
+`ArgocdClient` fetch their secret lazily — the same pattern used for the
+GitHub organization lookup (see below) — and cache it after first use, so a
+credential is never fetched more than once per process. This project runs
+Vault in **dev mode**, which auto-unseals and stores everything in memory;
+that is explicitly not production-safe (see Known limitations).
+
+**Client singletons defer all I/O to first use, not `__init__`.**
+`github_client`, `argocd_client`, and `k8s_client` are module-level
+singletons created as soon as their module is imported. Early versions did
+real work in `__init__` — an organization lookup, a Kubernetes config load,
+a Vault read — which meant simply *importing* one of these files required a
+reachable network, valid credentials, or a working kubeconfig, breaking
+`pytest` collection entirely (see the `ConnectionError` this caused when the
+Vault client's token fetch moved into `__init__` by mistake during the Vault
+migration). Every client now exposes its real dependencies through a
+cached `@property` instead, so construction is always cheap and safe, and
+the actual I/O only happens — and is only cached — on first real use.
+
 ## What it does today
 
 - `POST /services` — creates a GitHub repository from a language-specific
@@ -204,6 +228,9 @@ template, not a rule typed into the Prometheus/Alertmanager UI.
   - A platform-wide Grafana dashboard (`Platform Services Overview`) shows
     request rate, error rate, and p95 latency across all services,
     provisioned via a labeled `ConfigMap` rather than created manually
+- **Secrets management via Vault**: `GITHUB_TOKEN` and `ARGOCD_PASSWORD` are
+  stored in Vault (KV v2) and fetched lazily by `GithubClient`/`ArgocdClient`
+  on first use, instead of living directly in `.env`.
 - Idempotent by design: re-registering an existing repo, namespace, or
   Application is a no-op rather than an error.
 
@@ -214,6 +241,8 @@ template, not a rule typed into the Prometheus/Alertmanager UI.
 - **httpx** — ArgoCD REST API client (session auth, repository/application management)
 - **kubernetes** (official Python client) — namespace, quota, limit range,
   network policy, and RBAC provisioning
+- **hvac** — Vault client for reading secrets (GitHub token, ArgoCD password)
+- **HashiCorp Vault** — secrets storage (KV v2), dev mode
 - **ArgoCD** — GitOps continuous delivery
 - **GitHub Actions** — per-service CI/CD (build/push image, bump Helm values)
 - **kube-prometheus-stack** (Prometheus Operator, Prometheus, Grafana) — metrics,
@@ -235,8 +264,9 @@ platform-api/
 │   ├── clients/
 │   │   ├── github_client.py    # Repo creation, atomic template push (Git Tree API)
 │   │   ├── argocd_client.py    # Session auth, repo registration, Application lifecycle
-│   │   └── k8s_client.py       # Namespace, ResourceQuota, LimitRange,
-│   │                           # NetworkPolicy, ServiceAccount, Role, RoleBinding
+│   │   ├── k8s_client.py       # Namespace, ResourceQuota, LimitRange,
+│   │   │                       # NetworkPolicy, ServiceAccount, Role, RoleBinding
+│   │   └── vault_client.py     # Lazy, cached secret reads from Vault (KV v2)
 │   ├── routers/
 │   │   └── services.py         # POST /services orchestration
 │   └── templates/
@@ -246,12 +276,12 @@ platform-api/
 │                                # PrometheusRule
 ├── infra/
 │   ├── bootstrap.sh                                 # Provisions kind + ingress-nginx + ArgoCD
-│   │                                                 # + PostgreSQL + Backstage + Prometheus stack
+│   │                                                 # + PostgreSQL + Backstage + Prometheus stack + Vault
 │   ├── kind-config.yaml
 │   ├── app-config.production.yaml
 │   ├── .env.infra.example                           # Template for required secrets (gitignored when filled in)
 │   ├── values/                                      # Helm values (ArgoCD, PostgreSQL)
-│   ├── manifests/                                   # Backstage, CoreDNS, Prometheus/Grafana ingresses
+│   ├── manifests/                                   # Backstage, CoreDNS, Vault/Prometheus/Grafana ingresses
 │   └── grafana/
 │       ├── dashboard.json                          # Dashboard-as-code (JSON model)
 │       └── platform-services-overview-configmap.yaml
@@ -287,6 +317,9 @@ skip it entirely — Platform API only needs the following to be reachable:
   installed in the cluster (e.g. via the `kube-prometheus-stack` Helm chart),
   so that the `ServiceMonitor` and `PrometheusRule` resources each generated
   service ships with are actually picked up
+- [HashiCorp Vault](https://www.vaultproject.io/) installed and reachable,
+  with a `GITHUB_TOKEN` and `ARGOCD_PASSWORD` stored at `secret/platform-api`
+  (KV v2) — see [Running locally](#running-locally) below for how to seed it
 - A GitHub organization you have admin access to, and a
   [Personal Access Token](https://github.com/settings/tokens) with repo
   creation permissions
@@ -304,13 +337,25 @@ pip install -r requirements.txt
 Create a `.env` file:
 
 ```
-GITHUB_TOKEN=ghp_xxxxxxxxxxxx
+VAULT_ADDR=http://vault.test.com
+VAULT_TOKEN=your-vault-token
 GITHUB_ORG=your-org
 ARGOCD_SERVER=argocd.yourdomain.com
 ARGOCD_USERNAME=admin
-ARGOCD_PASSWORD=your-argocd-password
 DOCKERHUB_USERNAME=your-dockerhub-username
 ARGOCD_VERIFY_SSL=false
+```
+
+`GITHUB_TOKEN` and `ARGOCD_PASSWORD` are no longer read from `.env` — seed
+them into Vault instead:
+
+```bash
+export VAULT_ADDR=http://vault.test.com
+export VAULT_TOKEN=your-vault-token
+
+vault kv put secret/platform-api \
+  github_token="ghp_your_real_token" \
+  argocd_password="your_real_argocd_password"
 ```
 
 Kubernetes access is picked up automatically: the client tries
@@ -381,8 +426,16 @@ gaps, tracked as the next iteration of this project:
   fires and is visible in the Prometheus/Alertmanager UI, but Alertmanager
   is not yet wired to Slack/email/PagerDuty — routing and receivers are a
   next step.
-- **Secrets management** — GitHub/ArgoCD/DockerHub credentials are still
-  environment-variable based; no Vault integration yet.
+- **Vault runs in dev mode.** It auto-unseals and stores everything
+  in memory — appropriate for this project's local demo scope, but
+  explicitly not production-safe. A real deployment needs Integrated
+  Storage (Raft) or a proper backend, auto-unseal via a cloud KMS, and the
+  Kubernetes Auth Method instead of a static root token.
+- **Docker Hub credentials are still GitHub Actions secrets, not in Vault.**
+  `GITHUB_TOKEN` and `ARGOCD_PASSWORD` were migrated to Vault; the
+  `DOCKERHUB_TOKEN` used by each generated service's own CI/CD workflow is
+  unrelated to Platform API and still lives as a GitHub Actions repository
+  secret.
 - **Single language template** — only Python/Flask exists; Node/Go templates
   are planned.
 - **No background task / async status** — `POST /services` runs the full
@@ -396,4 +449,3 @@ originally scaffolded with [Backstage](https://backstage.io/). The full
 context — including the Backstage templates, Helm charts, and the reasoning
 behind moving CI/CD orchestration out of Backstage — is documented in the
 companion repository: `backstage-software-templates`.
-
